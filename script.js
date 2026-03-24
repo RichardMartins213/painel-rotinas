@@ -1,3 +1,25 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, query, orderBy, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBNeZm3DunGcQnFnzeNe2fnSZHBM6mtVcU",
+  authDomain: "painel-rotinas-so-folhas.firebaseapp.com",
+  projectId: "painel-rotinas-so-folhas",
+  storageBucket: "painel-rotinas-so-folhas.firebasestorage.app",
+  messagingSenderId: "405800876325",
+  appId: "1:405800876325:web:7b03cacffb8f0f439fc2cc",
+  measurementId: "G-7E15N4CBNV"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+const painelConfigRef = doc(db, 'painel_meta', 'app_state');
+const snapshotsCollectionRef = collection(db, 'painel_snapshots');
+let firebaseListenersIniciados = false;
+let firebaseInicializado = false;
+let firebaseConfigRecebida = false;
+let firebaseSnapshotsRecebidos = false;
+
 const STORAGE_KEYS = {
   adminLogged: 'sf_admin_logged',
   storeFormadorMap: 'sf_store_formador_map',
@@ -232,6 +254,118 @@ function carregarStore(chave, fallback) {
 
 function salvarStore(chave, valor) {
   localStorage.setItem(chave, JSON.stringify(valor));
+}
+
+async function salvarConfigNoFirebase() {
+  try {
+    await setDoc(painelConfigRef, {
+      appVersion: APP_STORAGE_VERSION,
+      storeFormadorMap: sanitizarMapaFormadores(lojaFormadorMap),
+      storePromotorMap: lojaPromotorMap,
+      storeRenameMap: lojaRenameMap,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (error) {
+    console.error('Erro ao salvar configuração no Firebase:', error);
+  }
+}
+
+async function salvarSnapshotNoFirebase(snapshot) {
+  try {
+    await setDoc(doc(db, 'painel_snapshots', snapshot.id), snapshot, { merge: true });
+  } catch (error) {
+    console.error('Erro ao salvar snapshot no Firebase:', error);
+    throw error;
+  }
+}
+
+async function excluirSnapshotNoFirebase(snapshotId) {
+  try {
+    await deleteDoc(doc(db, 'painel_snapshots', snapshotId));
+  } catch (error) {
+    console.error('Erro ao excluir snapshot no Firebase:', error);
+    throw error;
+  }
+}
+
+async function limparSnapshotsNoFirebase() {
+  const batch = writeBatch(db);
+  snapshotsImportados.forEach((snapshot) => {
+    batch.delete(doc(db, 'painel_snapshots', snapshot.id));
+  });
+  try {
+    await batch.commit();
+  } catch (error) {
+    console.error('Erro ao limpar snapshots no Firebase:', error);
+    throw error;
+  }
+}
+
+function normalizarSnapshotFirebase(snapshot) {
+  return {
+    ...snapshot,
+    importedAt: typeof snapshot.importedAt === 'string'
+      ? snapshot.importedAt
+      : (snapshot.importedAt?.toDate ? snapshot.importedAt.toDate().toISOString() : new Date().toISOString()),
+    data: Array.isArray(snapshot.data) ? snapshot.data : []
+  };
+}
+
+function aplicarEstadoRemoto() {
+  registrosBase = snapshotsImportados.length
+    ? consolidarSnapshotsImportados()
+    : normalizarBaseCompleta(registrosSimulados, 'simulada');
+
+  limparFiltros();
+  aplicarBase(
+    registrosBase,
+    snapshotsImportados.length ? 'importada' : 'simulada',
+    snapshotsImportados.length
+      ? `${registrosBase.length} registros consolidados de ${snapshotsImportados.length} planilha(s) importada(s).`
+      : 'Painel sem dados. Importe uma ou mais planilhas para carregar as rotinas.'
+  );
+
+  renderHistoricoPlanilhas();
+  atualizarResumoAdmin();
+  if (document.getElementById('adminModal') && !document.getElementById('adminPanelView')?.classList.contains('hidden')) {
+    popularControlesAdmin();
+  }
+}
+
+function iniciarFirebaseSync() {
+  if (firebaseListenersIniciados) return;
+  firebaseListenersIniciados = true;
+
+  onSnapshot(painelConfigRef, (snapshot) => {
+    const remoto = snapshot.data() || {};
+    lojaFormadorMap = sanitizarMapaFormadores({
+      ...defaultLojaFormadorMap,
+      ...normalizarMapaChaves(remoto.storeFormadorMap || lojaFormadorMap)
+    });
+    lojaPromotorMap = normalizarMapaChaves(remoto.storePromotorMap || lojaPromotorMap);
+    lojaRenameMap = normalizarMapaChaves({
+      ...defaultLojaRenameMap,
+      ...normalizarMapaChaves(remoto.storeRenameMap || lojaRenameMap)
+    });
+
+    salvarStore(STORAGE_KEYS.storeFormadorMap, lojaFormadorMap);
+    salvarStore(STORAGE_KEYS.storePromotorMap, lojaPromotorMap);
+    salvarStore(STORAGE_KEYS.storeRenameMap, lojaRenameMap);
+
+    firebaseConfigRecebida = true;
+    if (firebaseInicializado) aplicarEstadoRemoto();
+  }, (error) => {
+    console.error('Erro ao sincronizar configurações do Firebase:', error);
+  });
+
+  onSnapshot(query(snapshotsCollectionRef, orderBy('importedAt', 'desc')), (snapshot) => {
+    snapshotsImportados = snapshot.docs.map((item) => normalizarSnapshotFirebase({ id: item.id, ...item.data() }));
+    salvarStore(STORAGE_KEYS.importedSnapshots, snapshotsImportados);
+    firebaseSnapshotsRecebidos = true;
+    if (firebaseInicializado) aplicarEstadoRemoto();
+  }, (error) => {
+    console.error('Erro ao sincronizar planilhas do Firebase:', error);
+  });
 }
 
 function percentual(realizadas, total) {
@@ -1189,13 +1323,9 @@ async function importarArquivo() {
       latestDate: obterUltimaData(baseImportada),
       data: baseImportada
     };
-    snapshotsImportados = [snapshot, ...snapshotsImportados].slice(0, 30);
-    salvarStore(STORAGE_KEYS.importedSnapshots, snapshotsImportados);
-    localStorage.setItem(STORAGE_KEYS.activeSnapshotId, snapshot.id);
-    registrosBase = consolidarSnapshotsImportados();
+    await salvarSnapshotNoFirebase(snapshot);
     fileInput.value = '';
-    aplicarBase(registrosBase, 'importada', `${baseImportada.length} registros importados de ${arquivo.name}. Total consolidado: ${registrosBase.length} registros em ${snapshotsImportados.length} planilha(s).`);
-    renderHistoricoPlanilhas();
+    setImportStatus(`${baseImportada.length} registros importados de ${arquivo.name}. A sincronização online foi iniciada.`, 'Importado');
   } catch (error) {
     console.error(error);
     setImportStatus(error.message || 'Não foi possível importar o arquivo.', 'Falha na importação');
@@ -1203,15 +1333,12 @@ async function importarArquivo() {
 }
 
 function resetarParaSimulada() {
-  snapshotsImportados = [];
-  salvarStore(STORAGE_KEYS.importedSnapshots, snapshotsImportados);
-  localStorage.removeItem(STORAGE_KEYS.activeSnapshotId);
-  registrosBase = normalizarBaseCompleta(registrosSimulados, 'simulada');
-  fileInput.value = '';
-  limparFiltros();
-  aplicarBase(registrosBase, 'simulada', 'Painel limpo com sucesso. Nenhuma rotina carregada no momento.');
-  renderHistoricoPlanilhas();
-  atualizarResumoAdmin();
+  limparSnapshotsNoFirebase().then(() => {
+    if (fileInput) fileInput.value = '';
+    setImportStatus('Painel limpo com sucesso. A atualização foi enviada para todos os usuários.', 'Painel zerado');
+  }).catch(() => {
+    setImportStatus('Não foi possível limpar o painel no Firebase.', 'Falha');
+  });
 }
 
 function aplicarRegrasAdministrativasNaBaseAtual() {
@@ -1306,6 +1433,7 @@ function salvarVinculoLoja() {
   }
   lojaFormadorMap[slug(loja)] = formadorValido;
   salvarStore(STORAGE_KEYS.storeFormadorMap, sanitizarMapaFormadores(lojaFormadorMap));
+  salvarConfigNoFirebase();
   aplicarRegrasAdministrativasNaBaseAtual();
   feedback.textContent = `Vínculo salvo: ${loja} → ${formador}.`;
 }
@@ -1326,6 +1454,7 @@ function salvarNovoNomeLoja() {
     delete lojaFormadorMap[slug(lojaAtual)];
     salvarStore(STORAGE_KEYS.storeFormadorMap, sanitizarMapaFormadores(lojaFormadorMap));
   }
+  salvarConfigNoFirebase();
 
   registrosBase = registrosBase.map((item) => item.loja === lojaAtual ? { ...item, loja: novoNome } : item);
   aplicarRegrasAdministrativasNaBaseAtual();
@@ -1336,28 +1465,16 @@ function salvarNovoNomeLoja() {
 function usarSnapshot(snapshotId) {
   const snapshot = snapshotsImportados.find((item) => item.id === snapshotId);
   if (!snapshot) return;
-  snapshotsImportados = snapshotsImportados.map((item) => item.id === snapshotId ? { ...item, data: normalizarBaseCompleta(item.data, 'importada') } : item);
-  salvarStore(STORAGE_KEYS.importedSnapshots, snapshotsImportados);
-  registrosBase = consolidarSnapshotsImportados();
-  limparFiltros();
-  aplicarBase(registrosBase, 'importada', `Planilha ${snapshot.fileName} reprocessada. Total consolidado: ${registrosBase.length} registros em ${snapshotsImportados.length} planilha(s).`);
+  const atualizado = { ...snapshot, data: normalizarBaseCompleta(snapshot.data, 'importada') };
+  salvarSnapshotNoFirebase(atualizado)
+    .then(() => setImportStatus(`Planilha ${snapshot.fileName} reprocessada e sincronizada.`, 'Sincronizado'))
+    .catch(() => setImportStatus('Não foi possível reprocessar a planilha no Firebase.', 'Falha'));
 }
 
 function excluirSnapshot(snapshotId) {
-  snapshotsImportados = snapshotsImportados.filter((item) => item.id !== snapshotId);
-  salvarStore(STORAGE_KEYS.importedSnapshots, snapshotsImportados);
-  if (snapshotsImportados.length) {
-    registrosBase = consolidarSnapshotsImportados();
-    limparFiltros();
-    aplicarBase(registrosBase, 'importada', `Planilha removida. Total consolidado: ${registrosBase.length} registros em ${snapshotsImportados.length} planilha(s).`);
-  } else {
-    localStorage.removeItem(STORAGE_KEYS.activeSnapshotId);
-    registrosBase = normalizarBaseCompleta(registrosSimulados, 'simulada');
-    limparFiltros();
-    aplicarBase(registrosBase, 'simulada', 'Todas as planilhas foram removidas. O painel ficou zerado, sem rotinas carregadas.');
-  }
-  renderHistoricoPlanilhas();
-  atualizarResumoAdmin();
+  excluirSnapshotNoFirebase(snapshotId)
+    .then(() => setImportStatus('Planilha removida com sucesso. Todos os usuários verão a atualização.', 'Removida'))
+    .catch(() => setImportStatus('Não foi possível remover a planilha no Firebase.', 'Falha'));
 }
 
 function configurarAdmin() {
@@ -1488,3 +1605,5 @@ configurarEventos();
 configurarAdmin();
 configurarAbasResumo();
 inicializarBaseAtiva();
+firebaseInicializado = true;
+iniciarFirebaseSync();
